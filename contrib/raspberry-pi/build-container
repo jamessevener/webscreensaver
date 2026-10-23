@@ -1,0 +1,59 @@
+#!/bin/bash
+#
+# Build the Debian root filesystem that webscreensaver-container runs
+# webscreensaver in. Raspbian's own WebKit crashes on the Pi Zero/1 (armv6),
+# while Debian's armel port runs on those boards and has a current WebKit.
+#
+# Usage: build-container [ROOT]
+#   ROOT     where to build it (default /opt/debian-armel)
+#   ARCH     Debian architecture (default armel)
+#   SUITE    Debian release (default trixie)
+#
+# Run it again to rebuild from scratch (needs room for a second copy). To just update an existing root:
+#   sudo chroot /opt/debian-armel sh -c 'apt-get update && apt-get -y upgrade'
+
+set -euo pipefail
+
+ROOT=${1:-/opt/debian-armel}
+ARCH=${ARCH:-armel}
+SUITE=${SUITE:-trixie}
+KEYRING_DIR=/opt/debian-keyring
+MIRROR=https://deb.debian.org/debian
+
+sudo apt-get install -y mmdebstrap arch-test bubblewrap
+
+# Raspbian doesn't package Debian's archive keyring, so fetch it from Debian.
+if [[ ! -f $KEYRING_DIR/debian-archive-keyring.gpg ]]; then
+	tmp=$(mktemp -d)
+	trap 'rm -rf "$tmp"' EXIT
+	deb=$(curl -fsS "$MIRROR/pool/main/d/debian-archive-keyring/" |
+		grep -oE 'debian-archive-keyring_[0-9.]+_all\.deb' | sort -uV | tail -1)
+	curl -fsS -o "$tmp/$deb" "$MIRROR/pool/main/d/debian-archive-keyring/$deb"
+	dpkg-deb -x "$tmp/$deb" "$tmp/x"
+	sudo mkdir -p "$KEYRING_DIR"
+	sudo cp "$tmp"/x/usr/share/keyrings/debian-archive-keyring.* "$KEYRING_DIR/"
+fi
+
+# Build next to the old root and swap at the end, so a running kiosk keeps
+# working until then.
+NEW=$ROOT.new
+sudo rm -rf "$NEW"
+
+# Slow on a Pi Zero: it downloads and unpacks the whole GTK/WebKit stack.
+sudo mmdebstrap --arch="$ARCH" --variant=apt \
+	--keyring="$KEYRING_DIR/debian-archive-keyring.gpg" \
+	--include=python3-gi,gir1.2-gtk-3.0,gir1.2-webkit2-4.1,gir1.2-gtklayershell-0.1,ca-certificates,fonts-dejavu-core,bubblewrap \
+	--dpkgopt='path-exclude=/usr/share/doc/*' \
+	--dpkgopt='path-exclude=/usr/share/man/*' \
+	--dpkgopt='path-exclude=/usr/share/info/*' \
+	"$SUITE" "$NEW" \
+	"deb $MIRROR $SUITE main" \
+	"deb $MIRROR $SUITE-updates main" \
+	"deb http://security.debian.org/debian-security $SUITE-security main"
+
+if [[ -e $ROOT ]]; then
+	sudo mv "$ROOT" "$ROOT.old"
+fi
+sudo mv "$NEW" "$ROOT"
+sudo rm -rf "$ROOT.old"
+echo "Built $ROOT. Restart webscreensaver to use it."

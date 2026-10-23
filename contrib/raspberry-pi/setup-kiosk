@@ -1,0 +1,129 @@
+#!/bin/bash
+#
+# Set up a Raspberry Pi OS (labwc) device as a dedicated webscreensaver kiosk.
+# Run it as the desktop user (it uses sudo), then reboot.
+#
+# Usage: setup-kiosk [options] [webscreensaver args...]
+#
+#   --container       run WebKit from a Debian container (build-container).
+#                     Default on the Pi Zero/1 (armv6), whose Raspbian WebKit crashes.
+#   --no-container    use the system's WebKit
+#   --slim            free memory for the browser: disable Bluetooth, Avahi,
+#                     udisks2, rpcbind/NFS, and mask audio, portals and gvfs.
+#                     Audio and USB automounting stop working.
+#   --keep-desktop    don't switch to the kiosk-only session (kiosk-mode on)
+#
+# The webscreensaver args say what to show; -kiosk is added if missing.
+# Examples:
+#   setup-kiosk -url https://example.com
+#   setup-kiosk --slim -hide-cursor -sites-list ~/dashboard.toml    # Pi Zero W
+#
+# It also stops NetworkManager giving up on Wi-Fi and asking for the password
+# again, which happens on a busy Pi Zero when the handshake times out.
+#
+# Output goes to ~/.cache/webscreensaver/kiosk.log. `kiosk-mode off` brings the
+# desktop back for troubleshooting.
+
+set -euo pipefail
+
+here=$(dirname "$(readlink -f "$0")")
+repo=$(readlink -f "$here/../..")
+bin=$HOME/.local/bin
+autostart=${XDG_CONFIG_HOME:-$HOME/.config}/labwc/autostart
+
+container=auto
+slim=
+kiosk_mode=1
+args=()
+while (($#)); do
+	case $1 in
+		--container) container=1 ;;
+		--no-container) container= ;;
+		--slim) slim=1 ;;
+		--keep-desktop) kiosk_mode= ;;
+		--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
+		*) args+=("$1") ;;
+	esac
+	shift
+done
+
+if ((${#args[@]} == 0)); then
+	echo "Say what to show, e.g. setup-kiosk -url https://example.com (see --help)" >&2
+	exit 1
+fi
+if [[ ! " ${args[*]} " =~ " -kiosk " ]]; then
+	args=(-kiosk "${args[@]}")
+fi
+
+if [[ $container == auto ]]; then
+	container=
+	[[ $(uname -m) == armv6l ]] && container=1
+fi
+
+echo "== Packages"
+if [[ $container ]]; then
+	sudo apt-get install -y bubblewrap
+else
+	sudo apt-get install -y python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 gir1.2-gtklayershell-0.1
+fi
+
+echo "== Scripts in $bin"
+mkdir -p "$bin"
+install -m 755 "$repo/webscreensaver" "$repo/webscreensaver-container" "$here/kiosk-mode" "$bin/"
+
+run=$bin/webscreensaver
+if [[ $container ]]; then
+	run=$bin/webscreensaver-container
+	if [[ ! -d ${WEBSCREENSAVER_ROOT:-/opt/debian-armel} ]]; then
+		echo "== Container"
+		"$here/build-container" ${WEBSCREENSAVER_ROOT:+"$WEBSCREENSAVER_ROOT"}
+	fi
+fi
+
+echo "== Autostart in $autostart"
+mkdir -p "$(dirname "$autostart")"
+if [[ -f $autostart ]] && ! grep -q webscreensaver "$autostart"; then
+	cp -p "$autostart" "$autostart.before-kiosk"
+	echo "Old autostart saved as $autostart.before-kiosk"
+fi
+cmd=$(printf '%q ' "$run" "${args[@]}")
+env=PYTHONUNBUFFERED=1
+[[ ${WEBSCREENSAVER_ROOT:-} ]] && env+=" WEBSCREENSAVER_ROOT=$(printf '%q' "$WEBSCREENSAVER_ROOT")"
+cat > "$autostart" <<EOF
+# Kiosk (see setup-kiosk, kiosk-mode). Output: ~/.cache/webscreensaver/kiosk.log
+mkdir -p ~/.cache/webscreensaver; $env /usr/bin/lwrespawn ${cmd% } > ~/.cache/webscreensaver/kiosk.log 2>&1 &
+EOF
+cat "$autostart"
+
+echo "== Wi-Fi"
+# Retry forever instead of giving up and prompting for the password, and
+# turn off power saving, which drops the link under load.
+nmcli -t -f UUID,TYPE connection show | while IFS=: read -r uuid type; do
+	if [[ $type == 802-11-wireless ]]; then
+		sudo nmcli connection modify "$uuid" connection.autoconnect-retries 0 802-11-wireless.powersave 2
+		nmcli -g connection.id connection show "$uuid"
+	fi
+done
+
+if [[ $slim ]]; then
+	echo "== Services"
+	for unit in bluetooth.service avahi-daemon.service avahi-daemon.socket udisks2.service \
+			rpcbind.service rpcbind.socket nfs-blkmap.service; do
+		if [[ $(systemctl list-unit-files --no-legend "$unit") ]]; then
+			sudo systemctl disable --now "$unit" || true
+		fi
+	done
+	# For every user; they start again with: sudo systemctl --global unmask <unit>
+	sudo systemctl --global mask \
+		pipewire.service pipewire.socket pipewire-pulse.service pipewire-pulse.socket wireplumber.service \
+		xdg-desktop-portal.service xdg-desktop-portal-wlr.service xdg-desktop-portal-gtk.service \
+		gvfs-daemon.service gvfs-udisks2-volume-monitor.service gvfs-afc-volume-monitor.service \
+		gvfs-goa-volume-monitor.service gvfs-gphoto2-volume-monitor.service gvfs-mtp-volume-monitor.service
+fi
+
+if [[ $kiosk_mode ]]; then
+	echo "== Session"
+	"$bin/kiosk-mode" on
+else
+	echo "Reboot to start the kiosk."
+fi

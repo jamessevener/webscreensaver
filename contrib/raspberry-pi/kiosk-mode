@@ -1,0 +1,52 @@
+#!/bin/sh
+# Switch a Raspberry Pi OS (labwc) kiosk between the kiosk-only session and
+# the normal desktop. Takes effect at the next login/reboot.
+#
+#   kiosk-mode on      kiosk only (no desktop, panel or XDG autostart)
+#   kiosk-mode off     normal desktop; the kiosk is not started
+#   kiosk-mode status
+#
+# Pi OS starts labwc with -m, which runs /etc/xdg/labwc/autostart as well as
+# ~/.config/labwc/autostart, so the desktop and panel are turned off there.
+# The kiosk itself is the user autostart written by setup-kiosk; "off" moves
+# it aside to autostart.kiosk.
+
+SYS=/etc/xdg/labwc/autostart
+ORIG=$SYS.orig
+USER_AUTOSTART=${XDG_CONFIG_HOME:-$HOME/.config}/labwc/autostart
+SAVED=$USER_AUTOSTART.kiosk
+
+case $1 in
+	on)
+		if [ ! -f "$USER_AUTOSTART" ] && [ -f "$SAVED" ]; then
+			mv "$SAVED" "$USER_AUTOSTART"
+		fi
+		if ! grep -qs webscreensaver "$USER_AUTOSTART"; then
+			echo "No kiosk in $USER_AUTOSTART; run setup-kiosk first." >&2
+			exit 1
+		fi
+		[ -f "$ORIG" ] || sudo cp -p "$SYS" "$ORIG"
+		sudo tee "$SYS" >/dev/null <<-EOF
+		# Kiosk: desktop, panel and XDG autostart disabled to save memory.
+		# Original in autostart.orig; switch back with kiosk-mode off.
+		/usr/bin/kanshi &
+		EOF
+		echo "Kiosk mode on; reboot to apply."
+		;;
+	off)
+		[ -f "$ORIG" ] && sudo cp -p "$ORIG" "$SYS"
+		[ -f "$USER_AUTOSTART" ] && mv "$USER_AUTOSTART" "$SAVED"
+		echo "Desktop mode on; reboot to apply. The kiosk will not start (kiosk-mode on brings it back)."
+		;;
+	status)
+		if [ -f "$ORIG" ] && ! cmp -s "$ORIG" "$SYS"; then
+			echo "kiosk"
+		else
+			echo "desktop"
+		fi
+		;;
+	*)
+		echo "usage: kiosk-mode on|off|status" >&2
+		exit 1
+		;;
+esac
