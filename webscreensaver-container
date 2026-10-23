@@ -1,0 +1,91 @@
+#!/bin/bash
+#
+# Run webscreensaver inside a Debian root filesystem (made with debootstrap or
+# mmdebstrap) using bubblewrap. Useful when the host's WebKit is broken or too
+# old, e.g. Raspbian on a Pi Zero, where a Debian armel userspace has a newer one.
+#
+# Only WebKit and Python come from the container. The compositor, idle daemon
+# and screen locker stay on the host. -lock-command is run here, on the host,
+# because a locker inside the sandbox couldn't check passwords.
+#
+# Usage: webscreensaver-container [webscreensaver args...]
+#   WEBSCREENSAVER_ROOT    container root (default /opt/debian-armel)
+#   WEBSCREENSAVER_SCRIPT  webscreensaver script (default: next to this one)
+
+ROOT=${WEBSCREENSAVER_ROOT:-/opt/debian-armel}
+SCRIPT=${WEBSCREENSAVER_SCRIPT:-$(dirname "$(readlink -f "$0")")/webscreensaver}
+
+if [[ ! -d $ROOT ]]; then
+	echo "Container root $ROOT not found" >&2
+	exit 1
+fi
+if [[ -z $XDG_RUNTIME_DIR || -z $WAYLAND_DISPLAY ]]; then
+	echo "XDG_RUNTIME_DIR and WAYLAND_DISPLAY must be set" >&2
+	exit 1
+fi
+
+# The container's /etc/localtime is a symlink bwrap can't mount over, so pass
+# the host's zone by name instead (the container has its own tzdata).
+tz=${TZ:-$(readlink -f /etc/localtime | sed -n 's|^.*/zoneinfo/||p')}
+tz=${tz:-UTC}
+
+lock_cmd=
+args=()
+while (($#)); do
+	case $1 in
+		-lock-command|--lock-command) lock_cmd=$2; shift 2 ;;
+		*) args+=("$1"); shift ;;
+	esac
+done
+
+# A `pkill -f webscreensaver` (e.g. swayidle resume) also hits this wrapper and
+# bwrap. Ignore SIGTERM here, which bwrap inherits, so only webscreensaver
+# itself handles it and can lock before exiting.
+trap '' TERM
+
+ipc=$(mktemp -d "$XDG_RUNTIME_DIR/webscreensaver.XXXXXX") || exit 1
+helper=
+cleanup() {
+	[[ $helper ]] && kill "$helper" 2>/dev/null
+	rm -rf "$ipc"
+}
+trap cleanup EXIT
+
+if [[ $lock_cmd ]]; then
+	# webscreensaver asks for a lock through one FIFO and waits on the other
+	# until the host's locker reports the screen is locked.
+	mkfifo "$ipc/lock" "$ipc/locked"
+	(
+		trap - TERM
+		read -r _ < "$ipc/lock" || exit
+		sh -c "$lock_cmd"
+		echo > "$ipc/locked"
+	) &
+	helper=$!
+	args+=(-lock-command "echo > '$ipc/lock' && read -r _ < '$ipc/locked'")
+fi
+
+# Own PID namespace with webscreensaver as its PID 1: when it exits, the
+# kernel kills everything left in the namespace, e.g. WebKit processes that
+# didn't notice their parent is gone. (Without --as-pid-1, bwrap's own init
+# would wait for those stragglers and keep the namespace alive.)
+bwrap \
+	--ro-bind "$ROOT" / \
+	--unshare-pid \
+	--as-pid-1 \
+	--dev /dev \
+	--dev-bind-try /dev/dri /dev/dri \
+	--proc /proc \
+	--ro-bind /sys /sys \
+	--tmpfs /tmp \
+	--tmpfs /run \
+	--tmpfs /home \
+	--ro-bind /etc/resolv.conf /etc/resolv.conf \
+	--setenv TZ "$tz" \
+	--setenv LC_ALL C.UTF-8 \
+	--ro-bind-try /etc/machine-id /etc/machine-id \
+	--bind "$HOME" "$HOME" \
+	--bind "$XDG_RUNTIME_DIR" "$XDG_RUNTIME_DIR" \
+	--ro-bind "$SCRIPT" /run/webscreensaver \
+	--chdir "$HOME" \
+	/usr/bin/python3 /run/webscreensaver "${args[@]}"

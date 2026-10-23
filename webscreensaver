@@ -21,37 +21,124 @@
 
 import os
 import sys
+import time
 import random
 import signal
+import shutil
 import pathlib
+import subprocess
+
+# Until our own handler is installed, SIGTERM should just exit. This needs a
+# real handler: webscreensaver-container has us inherit an ignored SIGTERM,
+# and runs us as PID 1 of a namespace, which ignores default-action signals.
+signal.signal(signal.SIGTERM, lambda *_: os._exit(1))
+
+# xscreensaver may run us under XWayland; we must use the X11 backend to
+# reparent into the window it gives us.
+if os.getenv('XSCREENSAVER_WINDOW') or any(a.split('=')[0] in ('-window-id', '--window-id') for a in sys.argv):
+	os.environ['GDK_BACKEND'] = 'x11'
+
+# WebKit on armv6 (e.g. Raspberry Pi Zero/1) hits lock assertions in JavaScriptCore's
+# concurrent GC and crashes, failing page loads. These must be set before WebKit starts.
+if os.uname().machine == 'armv6l':
+	os.environ.setdefault('JSC_useConcurrentGC', '0')
+	os.environ.setdefault('JSC_useConcurrentJIT', '0')
 
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('GdkX11', '3.0')
-gi.require_version('WebKit2', '4.1')
 
-from gi.repository import Gtk, Gdk, GdkX11, GObject
+# 4.1 is the libsoup3 build; older systems may only have 4.0
+for webkit_version in ('4.1', '4.0'):
+	try:
+		gi.require_version('WebKit2', webkit_version)
+		break
+	except ValueError:
+		pass
+else:
+	sys.exit("WebKit2 GObject bindings not found; try: sudo apt install gir1.2-webkit2-4.1")
+
+from gi.repository import Gtk, Gdk, GLib
 from gi.repository import WebKit2 as WebKit
+
+try:
+	gi.require_version('GdkX11', '3.0')
+	from gi.repository import GdkX11
+except (ValueError, ImportError):
+	GdkX11 = None
+
+try:
+	gi.require_version('GtkLayerShell', '0.1')
+	from gi.repository import GtkLayerShell
+except (ValueError, ImportError):
+	GtkLayerShell = None
+
+
+BLACK = Gdk.RGBA(0, 0, 0, 1)
+BLACK_CSS = b"window.webscreensaver { background-color: black; }"
+
+
+def total_memory_mb():
+	try:
+		with open('/proc/meminfo') as f:
+			for line in f:
+				if line.startswith('MemTotal:'):
+					return int(line.split()[1]) // 1024
+	except (OSError, ValueError):
+		pass
+	return 0
 
 
 class WebScreensaver(object):
 	'''
-	A simple wrapper for WebKit which works as an XScreensaver Hack
+	A simple wrapper for WebKit which works as an XScreensaver Hack,
+	or standalone as a fullscreen screensaver or kiosk (e.g. on Wayland)
 	'''
 
-	def __init__(self, url='https://www.google.com', window_id=None, scripts=None, cookie_file=None, disk_cache=True):
+	# Ignore input for this long after starting, so activity that races
+	# with the idle timeout doesn't dismiss us straight away
+	INPUT_GRACE_SECS = 1.0
+
+	# Pointer must move this many pixels before it counts as activity
+	MOTION_THRESHOLD = 10
+
+	# Seconds between retries when a page fails to load
+	RETRY_SECS = 30
+
+	def __init__(self, url='https://www.google.com', window_id=None, scripts=None, cookie_file=None, disk_cache=True,
+			fullscreen=False, kiosk=False, all_monitors=False, lock_command=None, lock_after=0, debug=False, low_memory=False, hide_cursor=False):
 		self.window_id = window_id
 		self.scripts = scripts
 		self.url = url
 		self.cookie_file = cookie_file
 		self.disk_cache = disk_cache
+		self.fullscreen = fullscreen or kiosk
+		self.kiosk = kiosk
+		self.all_monitors = all_monitors
+		self.lock_command = lock_command
+		self.lock_after = lock_after
+		self.debug = debug
+		self.low_memory = low_memory
+		self.cursor_hidden = self.dismiss_on_input or (self.fullscreen and hide_cursor)
 
 		self.w = 640
 		self.h = 480
 
+		self.windows = []
+		self.browsers = []
+		self.started = time.monotonic()
+		self.motion_origin = None
+		self.dismissed = False
+
+	@property
+	def dismiss_on_input(self):
+		return self.fullscreen and not self.kiosk
+
 	def setup_window(self):
 		'''Perform some magic (if needed) to set up a Gtk window'''
 		if self.window_id:
+			if not GdkX11:
+				raise Exception("A window id was given, but GdkX11 is not available")
+
 			self.win = Gtk.Window(Gtk.WindowType.POPUP)
 
 			gdk_display = GdkX11.X11Display.get_default()
@@ -74,11 +161,97 @@ class WebScreensaver(object):
 			self.win = Gtk.Window()
 			self.win.set_default_size(self.w, self.h)
 
-	def setup_browser(self):
-		'''Sets up WebKit in our window'''
-		self.browser = WebKit.WebView()
+		self.windows.append(self.win)
 
-		settings = self.browser.get_settings()
+	def setup_fullscreen_windows(self):
+		'''One window per monitor. Only the first shows the page, unless all_monitors is set.'''
+		display = Gdk.Display.get_default()
+
+		css = Gtk.CssProvider()
+		css.load_from_data(BLACK_CSS)
+		Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+		for i in range(display.get_n_monitors()):
+			monitor = display.get_monitor(i)
+			show_page = (i == 0) or self.all_monitors
+
+			win = Gtk.Window()
+			win.get_style_context().add_class('webscreensaver')
+
+			# The screensaver goes above everything, panels included. A kiosk is a
+			# normal fullscreen window, so other windows (e.g. a terminal for
+			# troubleshooting) can still be brought in front of it.
+			if self.dismiss_on_input and GtkLayerShell and GtkLayerShell.is_supported():
+				GtkLayerShell.init_for_window(win)
+				GtkLayerShell.set_namespace(win, 'webscreensaver')
+				GtkLayerShell.set_monitor(win, monitor)
+				GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+				for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM, GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+					GtkLayerShell.set_anchor(win, edge, True)
+				GtkLayerShell.set_exclusive_zone(win, -1)
+				GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+			else:
+				if self.dismiss_on_input and i == 0:
+					print("Layer shell not available, falling back to a regular fullscreen window")
+				geom = monitor.get_geometry()
+				win.set_default_size(geom.width, geom.height)
+				win.fullscreen_on_monitor(win.get_screen(), i)
+
+			if self.cursor_hidden:
+				win.connect('realize', self.hide_cursor)
+
+			if show_page:
+				browser = self.make_browser()
+				win.add(browser)
+
+			self.windows.append(win)
+
+		if not self.windows:
+			raise Exception("No monitors found")
+
+	def hide_cursor(self, win):
+		gdk_win = win.get_window()
+		gdk_win.set_cursor(Gdk.Cursor.new_from_name(gdk_win.get_display(), 'none'))
+
+	def setup_context(self):
+		'''Settings shared by every WebView'''
+		if self.low_memory:
+			# Have WebKit release memory well before the system has to swap
+			pressure = WebKit.MemoryPressureSettings.new()
+			pressure.set_memory_limit(max(64, total_memory_mb() // 2))
+			# Applies to the network process, so must come before it starts
+			WebKit.WebsiteDataManager.set_memory_pressure_settings(pressure)
+
+			# Start each run with an empty disk cache, so files changed on the
+			# server are never shown stale from an earlier run
+			cache_dir = pathlib.Path(GLib.get_user_cache_dir()) / 'webscreensaver'
+			shutil.rmtree(cache_dir / 'WebKitCache', ignore_errors=True)
+			data_manager = WebKit.WebsiteDataManager(base_cache_directory=str(cache_dir))
+			context = WebKit.WebContext(memory_pressure_settings=pressure, website_data_manager=data_manager)
+			# No page cache, spare web processes or disk cache
+			context.set_cache_model(WebKit.CacheModel.DOCUMENT_VIEWER)
+			print("Low memory mode")
+		else:
+			context = WebKit.WebContext.get_default()
+
+			# Enable disk caching
+			if self.disk_cache:
+				context.set_cache_model(WebKit.CacheModel.WEB_BROWSER)
+				print("Cache directory:", context.get_website_data_manager().props.disk_cache_directory)
+
+		self.context = context
+
+		if self.cookie_file:
+			cookie_manager = context.get_cookie_manager()
+			cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.ALWAYS)
+			cookie_manager.set_persistent_storage(self.cookie_file, WebKit.CookiePersistentStorage.TEXT)
+
+	def make_browser(self):
+		'''Create a WebView with our settings'''
+		browser = WebKit.WebView(web_context=self.context)
+		browser.set_background_color(BLACK)
+
+		settings = browser.get_settings()
 
 		# Try to enable webgl
 		try:
@@ -86,12 +259,22 @@ class WebScreensaver(object):
 		except Exception as err:
 			print("Could not enable WebGL: {}".format(err))
 
-		# Enable disk caching
-		if self.disk_cache:
-			context = self.browser.get_context()
-			data_manager = context.get_website_data_manager()
-			context.set_cache_model(WebKit.CacheModel.WEB_BROWSER)
-			print("Cache directory:", data_manager.props.disk_cache_directory)
+		if self.debug:
+			settings.set_enable_write_console_messages_to_stdout(True)
+			browser.connect('resource-load-started', self.handle_resource_load_started)
+
+		browser.connect('load-changed', self.handle_load_changed)
+		browser.connect('load-failed', self.handle_load_failed)
+
+		self.browsers.append(browser)
+		return browser
+
+	def handle_resource_load_started(self, view, resource, request):
+		resource.connect('failed', lambda res, err: print("Failed to load:", res.get_uri(), err.message))
+
+	def setup_browser(self):
+		'''Sets up WebKit in our (xscreensaver or plain) window'''
+		self.browser = self.make_browser()
 
 		# Take a stab at guessing whether we are running in the
 		# XScreensaver preview window...
@@ -101,14 +284,14 @@ class WebScreensaver(object):
 
 		self.browser.set_size_request(self.w, self.h)
 
-		self.browser.connect('load-changed', self.handle_load_changed)
+	def handle_load_failed(self, view, load_event, failing_uri, error):
+		'''Keep retrying, e.g. when started at boot before the network is up'''
+		if error.matches(WebKit.NetworkError.quark(), WebKit.NetworkError.CANCELLED):
+			return False
 
-	def setup_cookie_jar(self):
-		if (self.cookie_file):
-			context = self.browser.get_context()
-			cookie_manager = context.get_cookie_manager()
-			cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.ALWAYS)
-			cookie_manager.set_persistent_storage(self.cookie_file, WebKit.CookiePersistentStorage.TEXT)
+		print("Load failed, retrying in %ds: %s (%s)" % (self.RETRY_SECS, failing_uri, error.message))
+		GLib.timeout_add_seconds(self.RETRY_SECS, lambda: view.load_uri(failing_uri) and False)
+		return False
 
 	def handle_load_changed(self, view, load_event: WebKit.LoadEvent):
 		print("Load changed:", view, load_event)
@@ -123,12 +306,14 @@ class WebScreensaver(object):
 		This will be executed for every frame within the browser.
 		'''
 
-		if not self.scripts:
-			return
+		scripts = list(self.scripts or [])
 
-		for script in self.scripts:
+		if self.cursor_hidden:
+			scripts.append(UserScripts.inject_css("* { cursor: none !important; }"))
+
+		for script in scripts:
 			print("Executing script: ", script)
-			self.browser.run_javascript(script, None, None, None)
+			view.run_javascript(script, None, None, None)
 
 	def setup_layout(self):
 		'''Make sure the browser can expand without affecting the window'''
@@ -136,25 +321,86 @@ class WebScreensaver(object):
 		sw.put(self.browser, 0, 0)
 		self.win.add(sw)
 
+	def handle_event(self, event, *_):
+		'''Sees every event before Gtk does, so the page can't swallow activity'''
+		if not self.dismissed and time.monotonic() - self.started > self.INPUT_GRACE_SECS:
+			etype = event.get_event_type()
+
+			if etype in (Gdk.EventType.KEY_PRESS, Gdk.EventType.BUTTON_PRESS,
+					Gdk.EventType.TOUCH_BEGIN, Gdk.EventType.SCROLL):
+				self.dismiss()
+				return
+			elif etype == Gdk.EventType.MOTION_NOTIFY:
+				pos = (event.x_root, event.y_root)
+				if self.motion_origin is None:
+					self.motion_origin = pos
+				elif max(abs(pos[0] - self.motion_origin[0]), abs(pos[1] - self.motion_origin[1])) > self.MOTION_THRESHOLD:
+					self.dismiss()
+					return
+
+		Gtk.main_do_event(event)
+
+	def lock_screen(self):
+		'''
+		Run the lock command and wait for it to return, so the desktop is never
+		revealed. The command should return once locked (e.g. `swaylock -f`).
+		'''
+		if not self.lock_command:
+			return
+
+		if time.monotonic() - self.started < self.lock_after:
+			return
+
+		print("Locking with:", self.lock_command)
+		proc = subprocess.Popen(self.lock_command, shell=True)
+		try:
+			proc.wait(timeout=10)
+		except subprocess.TimeoutExpired:
+			# Leave it running; killing it might unlock
+			print("Lock command still running; it should return once locked (e.g. `swaylock -f`)")
+
+	def dismiss(self):
+		if self.dismissed:
+			return
+		self.dismissed = True
+
+		self.lock_screen()
+		Gtk.main_quit()
+
 	def setup(self):
 		'''Do all the things!'''
-		self.setup_window()
-		self.setup_browser()
-		self.setup_layout()
-		self.setup_cookie_jar()
+		self.setup_context()
+
+		if self.fullscreen and not self.window_id:
+			self.setup_fullscreen_windows()
+		else:
+			self.setup_window()
+			self.setup_browser()
+			self.setup_layout()
 
 		def terminate(*args):
-			Gtk.main_quit()
+			if self.dismiss_on_input:
+				self.dismiss()
+			else:
+				Gtk.main_quit()
+			return GLib.SOURCE_REMOVE
 
-		self.win.connect('destroy', terminate)
-		self.win.connect('delete-event', terminate)
+		for win in self.windows:
+			win.connect('destroy', terminate)
+			win.connect('delete-event', terminate)
 
 		signal.signal(signal.SIGINT, signal.SIG_DFL)
-		signal.signal(signal.SIGTERM, terminate)
+		# Handle SIGTERM in the main loop, so it works while Gtk is busy
+		GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, terminate)
 
-		self.win.show_all()
+		if self.dismiss_on_input:
+			Gdk.event_handler_set(self.handle_event)
 
-		self.browser.load_uri(self.url)
+		for win in self.windows:
+			win.show_all()
+
+		for browser in self.browsers:
+			browser.load_uri(self.url)
 
 	@classmethod
 	def determine_window_id(cls, win_id=None):
@@ -279,11 +525,16 @@ class WebHacks(object):
 	@classmethod
 	def load_from_file(cls, file_path):
 		try:
-			import toml
+			import tomllib  # Python 3.11+
+			with open(file_path, 'rb') as f:
+				cfg = tomllib.load(f)
 		except ImportError:
-			raise Exception("Could not import `toml`, you probably need to install it via `pip install toml`")
+			try:
+				import toml
+			except ImportError:
+				raise Exception("Could not import `toml`, you probably need to install it via `pip install toml`")
 
-		cfg = toml.load(open(file_path, 'r'))
+			cfg = toml.load(open(file_path, 'r'))
 
 		hacks = [
 			cls.hack_from_config(site, section) for
@@ -369,6 +620,14 @@ if __name__ == "__main__":
 	parser.add_argument('-sites-list', type=str, help='List of sites to use instead of built-in list')
 	parser.add_argument('-cookie-file', metavar='PATH', help='Store cookies in PATH')
 	parser.add_argument('-no-cache', action='store_true', help='Disable disk caching of website data')
+	parser.add_argument('-fullscreen', action='store_true', help='Run standalone, covering every monitor, and exit on user activity (for swayidle etc.)')
+	parser.add_argument('-kiosk', action='store_true', help='Like -fullscreen, but the page is interactive and stays up until killed')
+	parser.add_argument('-hide-cursor', action='store_true', help='With -kiosk, hide the mouse pointer over the page (e.g. touchscreens or display-only kiosks)')
+	parser.add_argument('-all-monitors', action='store_true', help='Show the page on every monitor, not just the first (other monitors are black)')
+	parser.add_argument('-lock-command', metavar='CMD', help='With -fullscreen, run CMD to lock before exiting. It should return once locked, e.g. "swaylock -f"')
+	parser.add_argument('-low-memory', action='store_true', help='Use less memory at the cost of speed (default on systems with under 1GB RAM)')
+	parser.add_argument('-debug', action='store_true', help='Print the page\'s JavaScript console messages')
+	parser.add_argument('-lock-after', metavar='SECS', type=float, default=0, help='Only lock if the screensaver has been running at least SECS seconds')
 	args = parser.parse_args()
 
 	if args.sites_list:
@@ -400,7 +659,15 @@ if __name__ == "__main__":
 		window_id=WebScreensaver.determine_window_id(args.window_id),
 		scripts=scripts,
 		cookie_file=args.cookie_file,
-		disk_cache=not args.no_cache
+		disk_cache=not args.no_cache,
+		fullscreen=args.fullscreen,
+		kiosk=args.kiosk,
+		all_monitors=args.all_monitors,
+		lock_command=args.lock_command,
+		lock_after=args.lock_after,
+		debug=args.debug,
+		low_memory=args.low_memory or total_memory_mb() < 1024,
+		hide_cursor=args.hide_cursor,
 	)
 	saver.setup()
 
