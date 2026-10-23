@@ -5,10 +5,43 @@
 # and, if a desktop agent is running, waits on an "Authentication required"
 # dialog until someone clicks Connect. A kiosk has nobody to click it.
 #
-# Run as root every minute by wifi-keepalive.timer (installed by setup-kiosk):
-# when a Wi-Fi device has been disconnected or waiting for a password on two
-# runs in a row, bring its most recently used connection up again with the
-# stored password. That also cancels the pending dialog.
+# Run as root every minute by wifi-keepalive.timer: when a Wi-Fi device has
+# been disconnected or waiting for a password on two runs in a row, bring its
+# most recently used connection up again with the stored password. That also
+# cancels the pending dialog.
+#
+# Usage:
+#   wifi-keepalive install   install to /usr/local/sbin and start the timer
+#                            (setup-kiosk and setup-screensaver do this)
+#   wifi-keepalive           one check (what the timer runs)
+
+if [[ ${1:-} == install ]]; then
+	sudo install -m 755 "$0" /usr/local/sbin/wifi-keepalive
+	sudo tee /etc/systemd/system/wifi-keepalive.service >/dev/null <<'EOF'
+[Unit]
+Description=Reconnect Wi-Fi when NetworkManager is stuck
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wifi-keepalive
+EOF
+	sudo tee /etc/systemd/system/wifi-keepalive.timer >/dev/null <<'EOF'
+[Unit]
+Description=Check Wi-Fi every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+	sudo systemctl daemon-reload
+	sudo systemctl enable --now wifi-keepalive.timer
+	echo "wifi-keepalive installed."
+	exit 0
+fi
 
 state_dir=/run/wifi-keepalive
 mkdir -p "$state_dir"

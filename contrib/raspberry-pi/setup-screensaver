@@ -15,7 +15,8 @@
 #   --remove            remove the screensaver from the autostart
 #
 # The webscreensaver args pick the page (default -cycle); -fullscreen is
-# always added. Examples:
+# always added. It also installs wifi-keepalive, which reconnects Wi-Fi if
+# NetworkManager gets stuck waiting on a password dialog. Examples:
 #   setup-screensaver
 #   setup-screensaver --timeout 600 --lock -choose flyingtoasters
 #   setup-screensaver --timeout 600 --no-dmabuf -url https://dashboard.example.com
@@ -68,6 +69,10 @@ sudo apt-get install -y "${packages[@]}"
 echo "== Script in $bin"
 mkdir -p "$bin"
 install -m 755 "$repo/webscreensaver" "$bin/"
+
+echo "== Wi-Fi"
+# Reconnect when NetworkManager is stuck waiting on a password dialog.
+"$here/wifi-keepalive" install
 
 cmd=("$bin/webscreensaver" -fullscreen)
 [[ $no_dmabuf ]] && cmd=(env WEBKIT_DISABLE_DMABUF_RENDERER=1 "${cmd[@]}")

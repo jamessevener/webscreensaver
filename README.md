@@ -125,10 +125,11 @@ On a Pi Zero it is slow: a busy dashboard can take several minutes to first appe
 
 [`contrib/raspberry-pi`](contrib/raspberry-pi) has scripts that do all of the above on Raspberry Pi OS (labwc). Run them as the desktop user (they use sudo) from a clone of this repo, then reboot. Each has `--help`.
 
- * `setup-screensaver [--timeout SECS] [--lock] [--no-dmabuf] [args]`: idle screensaver via swayidle, for a Pi 4/5. `--lock` locks with swaylock when it's dismissed. Running it again replaces its earlier autostart entry; `--remove` takes it out.
+ * `setup-screensaver [--timeout SECS] [--lock] [--no-dmabuf] [args]`: idle screensaver via swayidle, for a Pi 4/5. `--lock` locks with swaylock when it's dismissed. It also installs `wifi-keepalive` (below). Running it again replaces its earlier autostart entry; `--remove` takes it out.
  * `setup-kiosk [--slim] [args]`: dedicated kiosk started at login, with the desktop and panel turned off. On a Pi Zero/1 it builds and uses the Debian container. It also stops NetworkManager giving up on Wi-Fi, and installs `wifi-keepalive`, a timer that reconnects Wi-Fi if NetworkManager gets stuck waiting on an "Authentication required" dialog after a busy Pi Zero misses a handshake. `--slim` turns off services a kiosk doesn't need (Bluetooth, audio, automounting, and cloud-init, which delays the network at every boot). Output goes to `~/.cache/webscreensaver/kiosk.log`.
  * `kiosk-mode on|off|status`: switch a kiosk back to the normal desktop for troubleshooting, and back again. Takes effect at the next reboot.
  * `build-container`: build or rebuild the Debian armel container.
+ * `wifi-keepalive install`: a timer that reconnects Wi-Fi if NetworkManager gets stuck waiting on an "Authentication required" dialog. Both setup scripts install it.
  * `night-mode setup [--sleep HH:MM] [--wake HH:MM] [--idle SECS]`: let the screen sleep at night (default 23:00 to 05:30). At night the screen turns off after `--idle` seconds without input (default 60), and the mouse, keyboard or touchscreen wakes it. Uses cron and wlopm, and works with both the screensaver and the kiosk. `night-mode on|off|status` switch it by hand; `night-mode remove` undoes setup.
 
 The page arguments are passed to webscreensaver. For example, a Pi 4 dashboard that comes on after 10 minutes idle, and a Pi Zero W kiosk:
