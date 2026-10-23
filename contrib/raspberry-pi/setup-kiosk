@@ -81,17 +81,22 @@ if [[ $container ]]; then
 fi
 
 echo "== Autostart in $autostart"
+# The kiosk is one marked block, so other entries (e.g. night-mode) stay.
+begin='# >>> webscreensaver kiosk (setup-kiosk) >>>'
+end='# <<< webscreensaver kiosk <<<'
 mkdir -p "$(dirname "$autostart")"
-if [[ -f $autostart ]] && ! grep -q webscreensaver "$autostart"; then
-	cp -p "$autostart" "$autostart.before-kiosk"
-	echo "Old autostart saved as $autostart.before-kiosk"
-fi
+touch "$autostart"
+# Also drop an earlier unmarked kiosk line and a block kiosk-mode off saved.
+sed -i -e "/^$begin\$/,/^$end\$/d" -e '/^# Kiosk (see /d' -e '/lwrespawn .*webscreensaver/d' "$autostart"
+rm -f "$autostart.kiosk"
 cmd=$(printf '%q ' "$run" "${args[@]}")
 env=PYTHONUNBUFFERED=1
 [[ ${WEBSCREENSAVER_ROOT:-} ]] && env+=" WEBSCREENSAVER_ROOT=$(printf '%q' "$WEBSCREENSAVER_ROOT")"
-cat > "$autostart" <<EOF
-# Kiosk (see setup-kiosk, kiosk-mode). Output: ~/.cache/webscreensaver/kiosk.log
+cat >> "$autostart" <<EOF
+$begin
+# Output: ~/.cache/webscreensaver/kiosk.log. Switch to the desktop with kiosk-mode off.
 mkdir -p ~/.cache/webscreensaver; $env /usr/bin/lwrespawn ${cmd% } > ~/.cache/webscreensaver/kiosk.log 2>&1 &
+$end
 EOF
 cat "$autostart"
 

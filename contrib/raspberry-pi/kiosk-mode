@@ -8,20 +8,23 @@
 #
 # Pi OS starts labwc with -m, which runs /etc/xdg/labwc/autostart as well as
 # ~/.config/labwc/autostart, so the desktop and panel are turned off there.
-# The kiosk itself is the user autostart written by setup-kiosk; "off" moves
-# it aside to autostart.kiosk.
+# The kiosk itself is a block in the user autostart written by setup-kiosk;
+# "off" moves that block aside to autostart.kiosk, leaving other entries.
 
 SYS=/etc/xdg/labwc/autostart
 ORIG=$SYS.orig
 USER_AUTOSTART=${XDG_CONFIG_HOME:-$HOME/.config}/labwc/autostart
 SAVED=$USER_AUTOSTART.kiosk
+BEGIN='# >>> webscreensaver kiosk (setup-kiosk) >>>'
+END='# <<< webscreensaver kiosk <<<'
 
 case $1 in
 	on)
-		if [ ! -f "$USER_AUTOSTART" ] && [ -f "$SAVED" ]; then
-			mv "$SAVED" "$USER_AUTOSTART"
+		if [ -f "$SAVED" ]; then
+			cat "$SAVED" >> "$USER_AUTOSTART"
+			rm "$SAVED"
 		fi
-		if ! grep -qs webscreensaver "$USER_AUTOSTART"; then
+		if ! grep -qsF "$BEGIN" "$USER_AUTOSTART"; then
 			echo "No kiosk in $USER_AUTOSTART; run setup-kiosk first." >&2
 			exit 1
 		fi
@@ -35,7 +38,10 @@ case $1 in
 		;;
 	off)
 		[ -f "$ORIG" ] && sudo cp -p "$ORIG" "$SYS"
-		[ -f "$USER_AUTOSTART" ] && mv "$USER_AUTOSTART" "$SAVED"
+		if grep -qsF "$BEGIN" "$USER_AUTOSTART"; then
+			sed -n "/^$BEGIN\$/,/^$END\$/p" "$USER_AUTOSTART" > "$SAVED"
+			sed -i "/^$BEGIN\$/,/^$END\$/d" "$USER_AUTOSTART"
+		fi
 		echo "Desktop mode on; reboot to apply. The kiosk will not start (kiosk-mode on brings it back)."
 		;;
 	status)

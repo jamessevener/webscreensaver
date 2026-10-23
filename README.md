@@ -129,6 +129,7 @@ On a Pi Zero it is slow: a busy dashboard can take several minutes to first appe
  * `setup-kiosk [--slim] [args]`: dedicated kiosk started at login, with the desktop and panel turned off. On a Pi Zero/1 it builds and uses the Debian container. It also stops NetworkManager giving up on Wi-Fi and asking for the password again, which a busy Pi Zero can trigger. `--slim` turns off services a kiosk doesn't need (Bluetooth, audio, automounting). Output goes to `~/.cache/webscreensaver/kiosk.log`.
  * `kiosk-mode on|off|status`: switch a kiosk back to the normal desktop for troubleshooting, and back again. Takes effect at the next reboot.
  * `build-container`: build or rebuild the Debian armel container.
+ * `night-mode setup [--sleep HH:MM] [--wake HH:MM] [--idle SECS]`: let the screen sleep at night (default 23:00 to 05:30). At night the screen turns off after `--idle` seconds without input (default 60), and the mouse, keyboard or touchscreen wakes it. Uses cron and wlopm, and works with both the screensaver and the kiosk. `night-mode on|off|status` switch it by hand; `night-mode remove` undoes setup.
 
 The page arguments are passed to webscreensaver. For example, a Pi 4 dashboard that comes on after 10 minutes idle, and a Pi Zero W kiosk:
 

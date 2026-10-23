@@ -1,0 +1,154 @@
+#!/bin/bash
+#
+# Let the screen sleep at night on Raspberry Pi OS (labwc). During the night
+# the screen turns off after a short idle time and any input (mouse, keyboard,
+# touch) turns it back on, until it is idle again.
+#
+# Usage:
+#   night-mode setup [--sleep HH:MM] [--wake HH:MM] [--idle SECS]
+#                      install: cron switches night mode on at --sleep (default
+#                      23:00) and off at --wake (default 05:30); at login it is
+#                      switched on if the login is during the night. --idle is
+#                      the night idle time before the screen sleeps (default 60).
+#   night-mode on      start night mode now
+#   night-mode off     stop it and turn the screen back on
+#   night-mode auto    on or off, depending on the time
+#   night-mode status
+#   night-mode remove  undo setup
+#
+# Night mode is a second swayidle that only manages screen power, so it works
+# alongside webscreensaver (setup-screensaver or setup-kiosk).
+
+set -euo pipefail
+
+conf=${XDG_CONFIG_HOME:-$HOME/.config}/webscreensaver/night-mode.conf
+autostart=${XDG_CONFIG_HOME:-$HOME/.config}/labwc/autostart
+bin=$HOME/.local/bin
+begin='# >>> night-mode >>>'
+end='# <<< night-mode <<<'
+
+SLEEP=23:00
+WAKE=05:30
+IDLE=60
+[[ -f $conf ]] && . "$conf"
+
+# Cron has no session environment: find the user's Wayland display.
+session() {
+	export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+	if [[ -z ${WAYLAND_DISPLAY:-} ]]; then
+		local sock
+		for sock in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
+			[[ -S $sock ]] && { WAYLAND_DISPLAY=${sock##*/}; break; }
+		done
+	fi
+	if [[ -z ${WAYLAND_DISPLAY:-} ]]; then
+		echo "No Wayland session; nothing to do." >&2
+		exit 0
+	fi
+	export WAYLAND_DISPLAY
+	pidfile=$XDG_RUNTIME_DIR/night-mode.pid
+}
+
+running() {
+	[[ -f $pidfile ]] && [[ $(ps -o comm= -p "$(cat "$pidfile")" 2>/dev/null) == swayidle ]]
+}
+
+minutes() {
+	local h=${1%:*} m=${1#*:}
+	echo $((10#$h * 60 + 10#$m))
+}
+
+is_night() {
+	local now sleep wake
+	now=$(minutes "$(date +%H:%M)")
+	sleep=$(minutes "$SLEEP")
+	wake=$(minutes "$WAKE")
+	if ((sleep > wake)); then
+		((now >= sleep || now < wake))
+	else
+		((now >= sleep && now < wake))
+	fi
+}
+
+start() {
+	session
+	if running; then
+		echo "Night mode already on."
+		return
+	fi
+	setsid swayidle timeout "$IDLE" "wlopm --off '*'" resume "wlopm --on '*'" \
+		>/dev/null 2>&1 </dev/null &
+	echo $! > "$pidfile"
+	echo "Night mode on: the screen sleeps after ${IDLE}s idle."
+}
+
+stop() {
+	session
+	if running; then
+		kill "$(cat "$pidfile")"
+	fi
+	rm -f "$pidfile"
+	wlopm --on '*' >/dev/null
+	echo "Night mode off."
+}
+
+setup() {
+	while (($#)); do
+		case $1 in
+			--sleep) SLEEP=$2; shift ;;
+			--wake) WAKE=$2; shift ;;
+			--idle) IDLE=$2; shift ;;
+			*) echo "Unknown option $1" >&2; exit 1 ;;
+		esac
+		shift
+	done
+	for t in "$SLEEP" "$WAKE"; do
+		[[ $t =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "Bad time $t (use HH:MM)" >&2; exit 1; }
+	done
+	[[ $IDLE =~ ^[0-9]+$ ]] || { echo "Bad --idle $IDLE" >&2; exit 1; }
+
+	sudo apt-get install -y swayidle wlopm cron
+
+	mkdir -p "$bin" "$(dirname "$conf")" "$(dirname "$autostart")"
+	if [[ $(readlink -f "$0") != $(readlink -f "$bin/night-mode") ]]; then
+		install -m 755 "$0" "$bin/night-mode"
+	fi
+	printf 'SLEEP=%s\nWAKE=%s\nIDLE=%s\n' "$SLEEP" "$WAKE" "$IDLE" > "$conf"
+
+	# Cron fields are minute and hour, without leading zeros.
+	local sh=$((10#${SLEEP%:*})) sm=$((10#${SLEEP#*:})) wh=$((10#${WAKE%:*})) wm=$((10#${WAKE#*:}))
+	{
+		crontab -l 2>/dev/null | sed "/^$begin\$/,/^$end\$/d" || true
+		printf '%s\n%s %s * * * %s on\n%s %s * * * %s off\n%s\n' \
+			"$begin" "$sm" "$sh" "$bin/night-mode" "$wm" "$wh" "$bin/night-mode" "$end"
+	} | crontab -
+
+	touch "$autostart"
+	sed -i "/^$begin\$/,/^$end\$/d" "$autostart"
+	printf '%s\n%s auto &\n%s\n' "$begin" "$bin/night-mode" "$end" >> "$autostart"
+
+	echo "Night mode: screen sleeps from $SLEEP to $WAKE after ${IDLE}s idle."
+	"$bin/night-mode" auto
+}
+
+remove() {
+	crontab -l 2>/dev/null | sed "/^$begin\$/,/^$end\$/d" | crontab - || true
+	[[ -f $autostart ]] && sed -i "/^$begin\$/,/^$end\$/d" "$autostart"
+	stop
+	echo "Night mode removed."
+}
+
+case ${1:-} in
+	setup) shift; setup "$@" ;;
+	on) start ;;
+	off) stop ;;
+	auto) if is_night; then start; else stop; fi ;;
+	status)
+		session
+		if running; then echo "on (sleep $SLEEP, wake $WAKE, idle ${IDLE}s)"; else echo "off (sleep $SLEEP, wake $WAKE)"; fi
+		wlopm
+		;;
+	remove) remove ;;
+	--help|-h) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" ;;
+	*) echo "usage: night-mode setup|on|off|auto|status|remove (see --help)" >&2; exit 1 ;;
+esac
