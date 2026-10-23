@@ -22,7 +22,9 @@
 #   setup-kiosk --slim -hide-cursor -sites-list ~/dashboard.toml    # Pi Zero W
 #
 # It also stops NetworkManager giving up on Wi-Fi and asking for the password
-# again, which happens on a busy Pi Zero when the handshake times out.
+# again, which happens on a busy Pi Zero when the handshake times out, and
+# installs wifi-keepalive to reconnect if it still gets stuck waiting on a
+# password dialog.
 #
 # Output goes to ~/.cache/webscreensaver/kiosk.log. `kiosk-mode off` brings the
 # desktop back for troubleshooting.
@@ -112,6 +114,30 @@ nmcli -t -f UUID,TYPE connection show | while IFS=: read -r uuid type; do
 		nmcli -g connection.id connection show "$uuid"
 	fi
 done
+# Reconnect when NetworkManager is stuck waiting on a password dialog.
+sudo install -m 755 "$here/wifi-keepalive" /usr/local/sbin/wifi-keepalive
+sudo tee /etc/systemd/system/wifi-keepalive.service >/dev/null <<'EOF'
+[Unit]
+Description=Reconnect Wi-Fi when NetworkManager is stuck
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wifi-keepalive
+EOF
+sudo tee /etc/systemd/system/wifi-keepalive.timer >/dev/null <<'EOF'
+[Unit]
+Description=Check Wi-Fi every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now wifi-keepalive.timer
 
 if [[ $slim ]]; then
 	echo "== Services"

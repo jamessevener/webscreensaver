@@ -1,0 +1,41 @@
+#!/bin/bash
+#
+# Reconnect Wi-Fi when NetworkManager gets stuck. After a handshake timeout
+# (common on a busy Pi Zero) NetworkManager assumes the password may be wrong
+# and, if a desktop agent is running, waits on an "Authentication required"
+# dialog until someone clicks Connect. A kiosk has nobody to click it.
+#
+# Run as root every minute by wifi-keepalive.timer (installed by setup-kiosk):
+# when a Wi-Fi device has been disconnected or waiting for a password on two
+# runs in a row, bring its most recently used connection up again with the
+# stored password. That also cancels the pending dialog.
+
+state_dir=/run/wifi-keepalive
+mkdir -p "$state_dir"
+
+# Most recently used Wi-Fi connection that is set to autoconnect.
+wifi_connection() {
+	nmcli -t -f UUID,TYPE,AUTOCONNECT,TIMESTAMP connection show |
+		awk -F: '$2 == "802-11-wireless" && $3 == "yes" { print $4, $1 }' |
+		sort -rn | awk 'NR == 1 { print $2 }'
+}
+
+nmcli -t -f DEVICE,TYPE device | while IFS=: read -r dev type; do
+	[[ $type == wifi ]] || continue
+	state=$(nmcli -g GENERAL.STATE device show "$dev")
+	state=${state%% *}
+	# 100 connected; below 30 the device is unmanaged or unavailable (e.g. rfkill).
+	if ((state == 100 || state < 30)); then
+		rm -f "$state_dir/$dev"
+		continue
+	fi
+	if [[ ! -f $state_dir/$dev ]]; then
+		touch "$state_dir/$dev"
+		continue
+	fi
+	rm -f "$state_dir/$dev"
+	uuid=$(wifi_connection)
+	[[ $uuid ]] || continue
+	echo "$dev stuck in state $state; reconnecting $(nmcli -g connection.id connection show "$uuid")"
+	nmcli --wait 60 connection up "$uuid" ifname "$dev" || true
+done
