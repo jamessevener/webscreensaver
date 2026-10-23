@@ -1,9 +1,11 @@
 webscreensaver
 ==============
 
-A screen hack which uses WebKit and works with XScreensaver or XFCE.
+A screen hack which uses WebKit and works with XScreensaver or XFCE, or standalone on Wayland as a screensaver or kiosk.
 
-**NOTE:** XScreensaver does not work on Wayland. On Wayland, run webscreensaver standalone with `-fullscreen` or `-kiosk` (see [Wayland](#wayland-standalone)).
+This fork of [lmartinking/webscreensaver](https://github.com/lmartinking/webscreensaver) adds the Wayland modes and setup scripts for Raspberry Pi OS.
+
+**NOTE:** XScreensaver does not work on Wayland. On Wayland, run webscreensaver standalone with `-fullscreen` or `-kiosk` (see [Wayland](#wayland-standalone)), or use the [Raspberry Pi setup scripts](#raspberry-pi-setup-scripts).
 
 **GNOME Users:** There have been reports of this not working with Gnome.
 
@@ -102,44 +104,46 @@ For a dedicated display, start it at login, e.g. `~/.config/autostart/webscreens
 
 `-debug` prints the page's JavaScript console and any failed requests.
 
-On devices with under 1GB of RAM (or with `-low-memory`), WebKit is set to use as little memory as it can: no page or disk cache, and memory-pressure limits so it frees memory before the system starts swapping.
+On devices with under 1GB of RAM (or with `-low-memory`), WebKit is set to use as little memory as it can: a minimal in-memory cache, the disk cache cleared at each start, and memory-pressure limits so it frees memory before the system starts swapping.
 
 ### Running WebKit from a container
 
 If the system's WebKit is broken or too old, `webscreensaver-container` runs webscreensaver against a Debian root filesystem using bubblewrap. The compositor, idle daemon and `-lock-command` stay on the host.
 
-For example, Raspbian trixie's WebKit (2.48.0) crashes on a Pi Zero/1 (armv6). Debian's armel port runs on those boards and has a current, security-supported WebKit:
+For example, Raspbian trixie's WebKit (2.48.0) crashes on a Pi Zero/1 (armv6). Debian's armel port runs on those boards and has a current, security-supported WebKit. [`contrib/raspberry-pi/build-container`](contrib/raspberry-pi/build-container) builds one with mmdebstrap (about 740MB), fetching Debian's archive keyring, which Raspbian doesn't package:
 
 ```
-    sudo apt install mmdebstrap arch-test bubblewrap
-    # Debian's archive keyring isn't packaged by Raspbian; get debian-archive-keyring from deb.debian.org
-    sudo mmdebstrap --arch=armel --variant=apt --keyring=/path/to/debian-archive-keyring.gpg \
-        --include=python3-gi,gir1.2-gtk-3.0,gir1.2-webkit2-4.1,gir1.2-gtklayershell-0.1,ca-certificates,fonts-dejavu-core,bubblewrap \
-        trixie /opt/debian-armel \
-        "deb http://deb.debian.org/debian trixie main" \
-        "deb http://security.debian.org/debian-security trixie-security main"
-
+    contrib/raspberry-pi/build-container          # builds /opt/debian-armel
     webscreensaver-container -kiosk -url https://example.com
 ```
 
-The script must sit next to `webscreensaver-container`, or be named with `WEBSCREENSAVER_SCRIPT`. The root defaults to `/opt/debian-armel` (`WEBSCREENSAVER_ROOT`). Update it with `sudo chroot /opt/debian-armel sh -c 'apt-get update && apt-get -y upgrade'`.
+The script must sit next to `webscreensaver-container`, or be named with `WEBSCREENSAVER_SCRIPT`. The root defaults to `/opt/debian-armel` (`WEBSCREENSAVER_ROOT`). Update it with `sudo chroot /opt/debian-armel sh -c 'apt-get update && apt-get -y upgrade'`, or rebuild it by running `build-container` again.
 
 On a Pi Zero it is slow: a busy dashboard can take several minutes to first appear, so it suits `-kiosk` better than an idle screensaver.
 
 ### Raspberry Pi setup scripts
 
-[`contrib/raspberry-pi`](contrib/raspberry-pi) has scripts that do all of the above on Raspberry Pi OS (labwc). Run them as the desktop user from a clone of this repo:
+[`contrib/raspberry-pi`](contrib/raspberry-pi) has scripts that do all of the above on Raspberry Pi OS (labwc). Run them as the desktop user (they use sudo) from a clone of this repo, then reboot. Each has `--help`.
 
- * `setup-screensaver [--timeout SECS] [--lock] [args]`: idle screensaver via swayidle (Pi 4/5). If the page shows as garbled stripes, add `--no-dmabuf`.
- * `setup-kiosk [--slim] [args]`: dedicated kiosk started at login, with the desktop and panel turned off. On a Pi Zero/1 it builds and uses the Debian container. `--slim` also turns off services a kiosk doesn't need (Bluetooth, audio, automounting).
- * `kiosk-mode on|off|status`: switch a kiosk back to the normal desktop for troubleshooting, and back again.
+ * `setup-screensaver [--timeout SECS] [--lock] [--no-dmabuf] [args]`: idle screensaver via swayidle, for a Pi 4/5. `--lock` locks with swaylock when it's dismissed. Running it again replaces its earlier autostart entry; `--remove` takes it out.
+ * `setup-kiosk [--slim] [args]`: dedicated kiosk started at login, with the desktop and panel turned off. On a Pi Zero/1 it builds and uses the Debian container. It also stops NetworkManager giving up on Wi-Fi and asking for the password again, which a busy Pi Zero can trigger. `--slim` turns off services a kiosk doesn't need (Bluetooth, audio, automounting). Output goes to `~/.cache/webscreensaver/kiosk.log`.
+ * `kiosk-mode on|off|status`: switch a kiosk back to the normal desktop for troubleshooting, and back again. Takes effect at the next reboot.
  * `build-container`: build or rebuild the Debian armel container.
 
-For example, a Pi Zero W showing a dashboard:
+The page arguments are passed to webscreensaver. For example, a Pi 4 dashboard that comes on after 10 minutes idle, and a Pi Zero W kiosk:
 
 ```
+    contrib/raspberry-pi/setup-screensaver --timeout 600 -url https://dashboard.example.com
     contrib/raspberry-pi/setup-kiosk --slim -hide-cursor -url https://dashboard.example.com
 ```
+
+To update a device, `git pull` and run the same command again.
+
+### Troubleshooting
+
+ * Run it by hand with `-debug` to see the page's console messages and failed requests (from SSH, set `XDG_RUNTIME_DIR=/run/user/$(id -u) WAYLAND_DISPLAY=wayland-0` first).
+ * Garbled horizontal stripes instead of the page: set `WEBKIT_DISABLE_DMABUF_RENDERER=1` (`--no-dmabuf` in `setup-screensaver`). Seen on a Pi 4 with a rotated screen.
+ * Pi Zero: the first load of a busy page can take several minutes, and large background images cost a lot of memory. Serve images sized for the screen.
 
 Sites List
 ----------
