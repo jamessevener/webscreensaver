@@ -10,12 +10,15 @@
 #   --timeout SECS      idle time before it starts (default 300)
 #   --lock              lock with swaylock when the screensaver is dismissed
 #   --lock-after SECS   with --lock, only lock if it ran at least SECS seconds
+#   --no-dmabuf         render WebKit without DMA-BUF, for when the page shows
+#                       as garbled stripes (seen on a Pi 4 with a rotated screen)
 #   --remove            remove the screensaver from the autostart
 #
 # The webscreensaver args pick the page (default -cycle); -fullscreen is
 # always added. Examples:
 #   setup-screensaver
 #   setup-screensaver --timeout 600 --lock -choose flyingtoasters
+#   setup-screensaver --timeout 600 --no-dmabuf -url https://dashboard.example.com
 #   setup-screensaver -sites-list ~/sites.toml -cycle
 
 set -euo pipefail
@@ -30,6 +33,7 @@ end='# <<< webscreensaver <<<'
 timeout=300
 lock=
 lock_after=
+no_dmabuf=
 remove=
 args=()
 while (($#)); do
@@ -37,6 +41,7 @@ while (($#)); do
 		--timeout) timeout=$2; shift ;;
 		--lock) lock=1 ;;
 		--lock-after) lock_after=$2; shift ;;
+		--no-dmabuf) no_dmabuf=1 ;;
 		--remove) remove=1 ;;
 		--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
 		*) args+=("$1") ;;
@@ -65,6 +70,7 @@ mkdir -p "$bin"
 install -m 755 "$repo/webscreensaver" "$bin/"
 
 cmd=("$bin/webscreensaver" -fullscreen)
+[[ $no_dmabuf ]] && cmd=(env WEBKIT_DISABLE_DMABUF_RENDERER=1 "${cmd[@]}")
 if [[ $lock ]]; then
 	cmd+=(-lock-command 'swaylock -f')
 	[[ $lock_after ]] && cmd+=(-lock-after "$lock_after")

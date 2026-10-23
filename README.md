@@ -130,7 +130,7 @@ On a Pi Zero it is slow: a busy dashboard can take several minutes to first appe
 
 [`contrib/raspberry-pi`](contrib/raspberry-pi) has scripts that do all of the above on Raspberry Pi OS (labwc). Run them as the desktop user from a clone of this repo:
 
- * `setup-screensaver [--timeout SECS] [--lock] [args]`: idle screensaver via swayidle (Pi 4/5).
+ * `setup-screensaver [--timeout SECS] [--lock] [args]`: idle screensaver via swayidle (Pi 4/5). If the page shows as garbled stripes, add `--no-dmabuf`.
  * `setup-kiosk [--slim] [args]`: dedicated kiosk started at login, with the desktop and panel turned off. On a Pi Zero/1 it builds and uses the Debian container. `--slim` also turns off services a kiosk doesn't need (Bluetooth, audio, automounting).
  * `kiosk-mode on|off|status`: switch a kiosk back to the normal desktop for troubleshooting, and back again.
  * `build-container`: build or rebuild the Debian armel container.
