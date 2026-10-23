@@ -10,7 +10,10 @@
 #   --no-container    use the system's WebKit
 #   --slim            free memory for the browser: disable Bluetooth, Avahi,
 #                     udisks2, rpcbind/NFS, and mask audio, portals and gvfs.
-#                     Audio and USB automounting stop working.
+#                     Audio and USB automounting stop working. Also turns off
+#                     cloud-init, which delays the network by about a minute
+#                     on every boot of a Pi Zero; changes to user-data or
+#                     network-config on the boot partition are then ignored.
 #   --keep-desktop    don't switch to the kiosk-only session (kiosk-mode on)
 #
 # The webscreensaver args say what to show; -kiosk is added if missing.
@@ -124,6 +127,11 @@ if [[ $slim ]]; then
 		xdg-desktop-portal.service xdg-desktop-portal-wlr.service xdg-desktop-portal-gtk.service \
 		gvfs-daemon.service gvfs-udisks2-volume-monitor.service gvfs-afc-volume-monitor.service \
 		gvfs-goa-volume-monitor.service gvfs-gphoto2-volume-monitor.service gvfs-mtp-volume-monitor.service
+	# Raspberry Pi OS runs cloud-init on every boot, in front of NetworkManager.
+	# Undo with: sudo rm /etc/cloud/cloud-init.disabled
+	if [[ -d /etc/cloud ]]; then
+		sudo touch /etc/cloud/cloud-init.disabled
+	fi
 fi
 
 if [[ $kiosk_mode ]]; then
